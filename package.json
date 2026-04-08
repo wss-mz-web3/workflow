@@ -6,8 +6,8 @@
   "main": "server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "caffeinate -disu node server.js --watch",
-    "dev": "node server.js --watch"
+    "start": "caffeinate -disu node --watch-path=server.js --watch-path=.env server.js",
+    "dev": "node --watch-path=server.js --watch-path=.env server.js"
   },
   "author": "",
   "license": "ISC",

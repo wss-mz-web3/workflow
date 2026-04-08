@@ -24,11 +24,27 @@ const TG_BASE = `https://api.telegram.org/bot${TG_TOKEN}`;
 let offset = 0;
 let polling = false;
 
+function describeError(err) {
+  if (!err) return "unknown error";
+  const parts = [err.message, err.cause?.message, err.code, err.cause?.code].filter(Boolean);
+  return [...new Set(parts)].join(" | ");
+}
+
 /**
  * 每个 chat 只允许一个任务运行
  * chatId -> { child, statusMessageId, replyToMessageId }
  */
 const runningJobs = new Map();
+
+/**
+ * 每个 chat 的工作目录，默认为 CODEX_WORKDIR
+ * chatId -> string
+ */
+const chatWorkdirs = new Map();
+
+function getChatWorkdir(chatId) {
+  return chatWorkdirs.get(chatId) || CODEX_WORKDIR;
+}
 
 /**
  * Telegram API with retry logic
@@ -198,9 +214,9 @@ function shouldNotify(event) {
 /**
  * 根据任务文本构造 prompt
  */
-function buildPrompt(userText) {
+function buildPrompt(userText, workdir) {
   return `
-你正在本机仓库中工作，工作目录是当前 CLI 启动目录。
+你正在本机工作，工作目录是：${workdir}
 
 执行要求：
 1. 可以修改代码并运行必要命令
@@ -231,19 +247,20 @@ async function runCodexJob(chatId, replyToMessageId, userText) {
 
   const statusMsg = await sendMessage(chatId, "任务已接收，正在启动 Codex…", replyToMessageId);
 
-  const prompt = buildPrompt(userText);
+  const workdir = getChatWorkdir(chatId);
+  const prompt = buildPrompt(userText, workdir);
 
   const args = [
     "exec",
     "--json",
     "--full-auto",
     "--add-dir",
-    "/Users/bilibili/Desktop",
+    workdir,
     prompt,
   ];
 
   const child = spawn("codex", args, {
-    cwd: CODEX_WORKDIR,
+    cwd: workdir,
     env: { ...process.env },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -403,10 +420,33 @@ async function handleMessage(message) {
         "在当前仓库实现一个移动端聊天窗口组件，并接入现有 demo 页面，完成后告诉我手机如何预览。",
         "",
         "可用命令：",
-        "/stop 停止当前任务",
+        `/pwd — 查看当前工作目录（默认：${CODEX_WORKDIR}）`,
+        "/cd <路径> — 切换工作目录",
+        "/stop — 停止当前任务",
       ].join("\n"),
       messageId
     );
+    return;
+  }
+
+  if (text === "/pwd") {
+    await sendMessage(chatId, `当前工作目录：${getChatWorkdir(chatId)}`, messageId);
+    return;
+  }
+
+  if (text.startsWith("/cd ")) {
+    const newDir = text.slice(4).trim();
+    if (!newDir) {
+      await sendMessage(chatId, "用法：/cd <路径>", messageId);
+      return;
+    }
+    const { existsSync, statSync } = await import("node:fs");
+    if (!existsSync(newDir) || !statSync(newDir).isDirectory()) {
+      await sendMessage(chatId, `路径不存在或不是目录：${newDir}`, messageId);
+      return;
+    }
+    chatWorkdirs.set(chatId, newDir);
+    await sendMessage(chatId, `工作目录已切换为：${newDir}`, messageId);
     return;
   }
 
@@ -466,10 +506,10 @@ async function startPolling() {
       const isNetwork = e.code === 'ECONNRESET' || e.cause?.code === 'ECONNRESET' || e.name === 'AbortError';
       if (isNetwork) {
         backoff = Math.min(backoff * 2, 30000);
-        console.error(`poll network error (retrying in ${backoff}ms):`, e.message);
+        console.error(`poll network error (retrying in ${backoff}ms):`, describeError(e));
       } else {
         backoff = POLL_INTERVAL_MS;
-        console.error("poll error:", e.message);
+        console.error("poll error:", describeError(e));
       }
     }
 
