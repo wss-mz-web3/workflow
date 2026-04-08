@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import { spawn } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
 
 dotenv.config();
@@ -44,6 +45,23 @@ const chatWorkdirs = new Map();
 
 function getChatWorkdir(chatId) {
   return chatWorkdirs.get(chatId) || CODEX_WORKDIR;
+}
+
+function isExistingDirectory(dir) {
+  return existsSync(dir) && statSync(dir).isDirectory();
+}
+
+function parseReportedWorkdir(text) {
+  if (!text) return null;
+
+  const match = text.match(/(?:^|\n)WORKDIR:\s*(.+?)(?:\n|$)/);
+  if (!match) return null;
+
+  const dir = match[1].trim();
+  if (!dir.startsWith("/")) return null;
+  if (!isExistingDirectory(dir)) return null;
+
+  return dir;
 }
 
 /**
@@ -226,6 +244,8 @@ function buildPrompt(userText, workdir) {
 5. 尽量少改动现有结构
 6. 完成后总结改动文件、执行过的关键命令、结果
 7. 如遇到失败，明确告诉我失败点和下一步建议
+8. 最终回复最后单独输出一行：WORKDIR: <绝对路径>
+9. 这个 WORKDIR 表示下次任务默认执行目录；如果本次进入了别的目录并决定后续继续在那里工作，就输出那个目录，否则输出当前工作目录
 
 用户任务：
 ${userText}
@@ -367,6 +387,9 @@ async function runCodexJob(chatId, replyToMessageId, userText) {
     runningJobs.delete(chatId);
 
     if (code === 0) {
+      const nextWorkdir = parseReportedWorkdir(finalAgentText) || workdir;
+      chatWorkdirs.set(chatId, nextWorkdir);
+
       try {
         await editMessage(chatId, statusMsg.message_id, "任务完成。");
       } catch {}
@@ -440,8 +463,7 @@ async function handleMessage(message) {
       await sendMessage(chatId, "用法：/cd <路径>", messageId);
       return;
     }
-    const { existsSync, statSync } = await import("node:fs");
-    if (!existsSync(newDir) || !statSync(newDir).isDirectory()) {
+    if (!isExistingDirectory(newDir)) {
       await sendMessage(chatId, `路径不存在或不是目录：${newDir}`, messageId);
       return;
     }
