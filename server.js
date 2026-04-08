@@ -1,428 +1,483 @@
-require("dotenv").config();
+import dotenv from "dotenv";
+import { spawn } from "node:child_process";
+import { ProxyAgent, setGlobalDispatcher } from "undici";
 
-const fs = require("fs");
-const path = require("path");
-const express = require("express");
-const TelegramBot = require("node-telegram-bot-api");
-const { exec } = require("child_process");
+dotenv.config();
 
-const app = express();
-
-const {
-  TELEGRAM_BOT_TOKEN,
-  TELEGRAM_ALLOWED_USER_ID,
-  PROJECT_DIR,
-  BUILD_COMMAND = "npm run build",
-  DEPLOY_COMMAND = "vercel --yes",
-  CODE_COMMAND_PREFIX = "codex exec",
-  PORT = "8787",
-  TASK_TIMEOUT_MS = "1800000", // 30 min
-  MAX_OUTPUT_CHARS = "3500"
-} = process.env;
-
-if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_ALLOWED_USER_ID || !PROJECT_DIR) {
-  console.error("Missing required env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, PROJECT_DIR");
-  process.exit(1);
+const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+if (proxyUrl) {
+  setGlobalDispatcher(new ProxyAgent(proxyUrl));
+  console.log(`Using proxy: ${proxyUrl}`);
 }
 
-const RESOLVED_PROJECT_DIR = path.resolve(PROJECT_DIR);
-const STATUS_FILE = path.join(__dirname, "status.json");
-const LOG_DIR = path.join(__dirname, "logs");
-const MAX_OUTPUT = Number(MAX_OUTPUT_CHARS);
-const TIMEOUT_MS = Number(TASK_TIMEOUT_MS);
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const ALLOWED_USER_ID = String(process.env.TELEGRAM_ALLOWED_USER_ID || "");
+const CODEX_WORKDIR = process.env.CODEX_WORKDIR || process.cwd();
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 1200);
 
-if (!fs.existsSync(LOG_DIR)) {
-  fs.mkdirSync(LOG_DIR, { recursive: true });
+if (!TG_TOKEN) {
+  throw new Error("Missing TELEGRAM_BOT_TOKEN");
 }
 
-const botOptions = { polling: true };
-if (process.env.HTTPS_PROXY || process.env.HTTP_PROXY) {
-  botOptions.request = { proxy: process.env.HTTPS_PROXY || process.env.HTTP_PROXY };
-}
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, botOptions);
+const TG_BASE = `https://api.telegram.org/bot${TG_TOKEN}`;
 
-function nowIso() {
-  return new Date().toISOString();
-}
+let offset = 0;
+let polling = false;
 
-function defaultStatus() {
-  return {
-    busy: false,
-    currentTask: "",
-    currentTaskType: "",
-    lastMessage: "idle",
-    lastBuildOk: null,
-    lastDeployOk: null,
-    lastCodeOk: null,
-    lastPreviewUrl: "",
-    lastLogFile: "",
-    lastUpdatedAt: nowIso()
-  };
-}
+/**
+ * 每个 chat 只允许一个任务运行
+ * chatId -> { child, statusMessageId, replyToMessageId }
+ */
+const runningJobs = new Map();
 
-function readStatus() {
-  try {
-    return JSON.parse(fs.readFileSync(STATUS_FILE, "utf8"));
-  } catch {
-    return defaultStatus();
-  }
-}
+/**
+ * Telegram API with retry logic
+ */
+async function tg(method, body = {}, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(`${TG_BASE}/${method}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30000), // 30s timeout
+      });
 
-function writeStatus(status) {
-  fs.writeFileSync(STATUS_FILE, JSON.stringify(status, null, 2), "utf8");
-}
+      const data = await res.json();
 
-function setStatus(patch) {
-  const current = readStatus();
-  const next = {
-    ...current,
-    ...patch,
-    lastUpdatedAt: nowIso()
-  };
-  writeStatus(next);
-  return next;
-}
-
-function isAllowed(msg) {
-  return String(msg.from?.id || "") === String(TELEGRAM_ALLOWED_USER_ID);
-}
-
-function sanitizeText(text) {
-  if (!text) return "";
-  return text.replace(/\0/g, "").trim();
-}
-
-function shortText(text, max = MAX_OUTPUT) {
-  const clean = sanitizeText(text);
-  if (clean.length <= max) return clean;
-  return `${clean.slice(0, max)}\n\n...已截断`;
-}
-
-function shellQuoteSingle(str) {
-  return `'${String(str).replace(/'/g, `'\\''`)}'`;
-}
-
-function makeLogFile(prefix) {
-  const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  return path.join(LOG_DIR, `${prefix}-${ts}.log`);
-}
-
-function appendLog(file, content) {
-  fs.appendFileSync(file, content, "utf8");
-}
-
-function runCommand(command, cwd, logFile) {
-  return new Promise((resolve) => {
-    const startedAt = Date.now();
-    appendLog(logFile, `\n=== ${nowIso()} ===\n`);
-    appendLog(logFile, `CWD: ${cwd}\n`);
-    appendLog(logFile, `CMD: ${command}\n\n`);
-
-    exec(
-      command,
-      {
-        cwd,
-        timeout: TIMEOUT_MS,
-        maxBuffer: 1024 * 1024 * 20,
-        env: process.env,
-        shell: "/bin/bash"
-      },
-      (error, stdout, stderr) => {
-        const durationMs = Date.now() - startedAt;
-        const out = stdout || "";
-        const err = stderr || "";
-
-        appendLog(logFile, `STDOUT:\n${out}\n`);
-        appendLog(logFile, `STDERR:\n${err}\n`);
-        appendLog(
-          logFile,
-          `RESULT: ${error ? "FAILED" : "SUCCESS"} | duration_ms=${durationMs}\n`
-        );
-
-        resolve({
-          ok: !error,
-          stdout: out,
-          stderr: err,
-          error: error ? error.message : "",
-          durationMs
-        });
+      if (!data.ok) {
+        throw new Error(`Telegram API error: ${JSON.stringify(data)}`);
       }
-    );
-  });
-}
 
-function extractUrl(text) {
-  if (!text) return "";
-  const matches = text.match(/https?:\/\/[^\s)]+/g);
-  if (!matches || !matches.length) return "";
-  return matches[matches.length - 1];
-}
+      return data.result;
+    } catch (err) {
+      const isLastRetry = i === retries - 1;
+      const isNetworkError = err.code === 'ECONNRESET' || err.cause?.code === 'ECONNRESET' || err.name === 'AbortError';
 
-async function sendLongMessage(chatId, text) {
-  const content = String(text || "");
-  const chunkSize = 3500;
-  for (let i = 0; i < content.length; i += chunkSize) {
-    await bot.sendMessage(chatId, content.slice(i, i + chunkSize));
+      if (isNetworkError && !isLastRetry) {
+        const delay = Math.min(1000 * Math.pow(2, i), 5000); // exponential backoff, max 5s
+        console.log(`Retry ${i + 1}/${retries} for ${method} after ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+
+      throw err;
+    }
   }
 }
 
-async function rejectIfBusy(chatId) {
-  const status = readStatus();
-  if (!status.busy) return false;
-  await bot.sendMessage(
-    chatId,
-    `当前有任务正在执行：${status.currentTask || "unknown"}`
-  );
-  return true;
+async function sendMessage(chatId, text, replyToMessageId = undefined) {
+  return tg("sendMessage", {
+    chat_id: chatId,
+    text,
+    reply_to_message_id: replyToMessageId,
+    disable_web_page_preview: true,
+  });
 }
 
-async function handleBuild(chatId) {
-  if (await rejectIfBusy(chatId)) return;
-
-  const logFile = makeLogFile("build");
-  setStatus({
-    busy: true,
-    currentTask: "build",
-    currentTaskType: "build",
-    lastMessage: "building",
-    lastLogFile: logFile
+async function editMessage(chatId, messageId, text) {
+  return tg("editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    disable_web_page_preview: true,
   });
+}
 
-  await bot.sendMessage(chatId, "开始 build...");
+function safeText(input, max = 3500) {
+  if (input == null) return "";
+  const s = String(input);
+  return s.length > max ? `${s.slice(0, max)}\n…(已截断)` : s;
+}
 
-  const result = await runCommand(BUILD_COMMAND, RESOLVED_PROJECT_DIR, logFile);
+async function sendLongMessage(chatId, text, replyToMessageId = undefined) {
+  const MAX = 3500;
+  const s = String(text || "");
+  if (!s) return;
 
-  if (result.ok) {
-    setStatus({
-      busy: false,
-      currentTask: "",
-      currentTaskType: "",
-      lastBuildOk: true,
-      lastMessage: "build success"
-    });
-    await bot.sendMessage(
-      chatId,
-      `Build 成功。\n耗时 ${Math.round(result.durationMs / 1000)} 秒`
-    );
-  } else {
-    setStatus({
-      busy: false,
-      currentTask: "",
-      currentTaskType: "",
-      lastBuildOk: false,
-      lastMessage: "build failed"
-    });
-
-    const message = shortText(result.stderr || result.error || result.stdout || "Build failed");
-    await sendLongMessage(chatId, `Build 失败。\n\n${message}`);
+  for (let i = 0; i < s.length; i += MAX) {
+    const part = s.slice(i, i + MAX);
+    await sendMessage(chatId, part, replyToMessageId);
   }
 }
 
-async function handleDeploy(chatId) {
-  if (await rejectIfBusy(chatId)) return;
-
-  const logFile = makeLogFile("deploy");
-  setStatus({
-    busy: true,
-    currentTask: "deploy",
-    currentTaskType: "deploy",
-    lastMessage: "deploying",
-    lastLogFile: logFile
-  });
-
-  await bot.sendMessage(chatId, "开始 deploy...");
-
-  const result = await runCommand(DEPLOY_COMMAND, RESOLVED_PROJECT_DIR, logFile);
-  const combined = `${result.stdout || ""}\n${result.stderr || ""}`;
-  const previewUrl = extractUrl(combined);
-
-  if (result.ok && previewUrl) {
-    setStatus({
-      busy: false,
-      currentTask: "",
-      currentTaskType: "",
-      lastDeployOk: true,
-      lastPreviewUrl: previewUrl,
-      lastMessage: "deploy success"
-    });
-
-    await bot.sendMessage(
-      chatId,
-      `Deploy 成功。\n耗时 ${Math.round(result.durationMs / 1000)} 秒\n\n预览地址：\n${previewUrl}`
-    );
-  } else if (result.ok) {
-    setStatus({
-      busy: false,
-      currentTask: "",
-      currentTaskType: "",
-      lastDeployOk: true,
-      lastMessage: "deploy success but no url"
-    });
-
-    await sendLongMessage(
-      chatId,
-      `Deploy 看起来成功了，但没有识别到预览链接。\n\n${shortText(combined || "No output")}`
-    );
-  } else {
-    setStatus({
-      busy: false,
-      currentTask: "",
-      currentTaskType: "",
-      lastDeployOk: false,
-      lastMessage: "deploy failed"
-    });
-
-    const message = shortText(result.stderr || result.error || result.stdout || "Deploy failed");
-    await sendLongMessage(chatId, `Deploy 失败。\n\n${message}`);
-  }
+function isAllowedUser(message) {
+  if (!ALLOWED_USER_ID) return true;
+  return String(message.from?.id || "") === ALLOWED_USER_ID;
 }
 
-async function handleCode(chatId, promptText) {
-  if (await rejectIfBusy(chatId)) return;
+/**
+ * 把 codex --json 事件格式化成 Telegram 可读文本
+ */
+function formatCodexEvent(event) {
+  const item = event.item || {};
+  const type = item.type || event.type || "unknown";
 
-  const cleanedPrompt = sanitizeText(promptText);
-  if (!cleanedPrompt) {
-    await bot.sendMessage(chatId, "用法：/code 你的需求");
+  // 一些常见事件
+  if (type === "agent_message") {
+    return `Codex：${safeText(item.text || event.text || "")}`;
+  }
+
+  if (type === "plan_update") {
+    return `计划更新：${safeText(item.text || item.plan || event.text || "已更新")}`;
+  }
+
+  if (type === "command_execution") {
+    const cmd = item.command || item.cmd || "(unknown command)";
+    const status = item.status || event.status || "running";
+    const output = item.output ? `\n输出：\n${safeText(item.output, 1200)}` : "";
+    return `执行命令 [${status}]：\n${safeText(cmd, 1200)}${output}`;
+  }
+
+  if (type === "file_change") {
+    const path = item.path || item.file || "(unknown file)";
+    const change = item.change_type || item.change || "modified";
+    return `文件变更：${change} ${path}`;
+  }
+
+  if (type === "reasoning") {
+    return `思考摘要：${safeText(item.text || event.text || "")}`;
+  }
+
+  if (type === "web_search") {
+    return `搜索：${safeText(item.query || event.query || "")}`;
+  }
+
+  // turn 事件
+  if (event.type === "turn.started") {
+    return "Codex 已启动，正在分析任务…";
+  }
+
+  if (event.type === "turn.completed") {
+    return "Codex 已完成当前轮次。";
+  }
+
+  if (event.type === "turn.failed") {
+    return `Codex 执行失败：${safeText(event.error || event.message || "")}`;
+  }
+
+  if (event.type === "error") {
+    return `错误：${safeText(event.message || JSON.stringify(event), 1500)}`;
+  }
+
+  return `${type}：${safeText(JSON.stringify(event), 1200)}`;
+}
+
+/**
+ * 过滤哪些事件需要发给 Telegram
+ */
+function shouldNotify(event) {
+  if (!event || !event.type) return false;
+
+  if (
+    event.type === "turn.started" ||
+    event.type === "turn.completed" ||
+    event.type === "turn.failed" ||
+    event.type === "error"
+  ) {
+    return true;
+  }
+
+  if (event.type === "item.started" || event.type === "item.completed") {
+    const t = event.item?.type;
+    return [
+      "plan_update",
+      "agent_message",
+      "command_execution",
+      "file_change",
+      "reasoning",
+      "web_search",
+    ].includes(t);
+  }
+
+  return false;
+}
+
+/**
+ * 根据任务文本构造 prompt
+ */
+function buildPrompt(userText) {
+  return `
+你正在本机仓库中工作，工作目录是当前 CLI 启动目录。
+
+执行要求：
+1. 可以修改代码并运行必要命令
+2. 每完成关键步骤都输出简短进度
+3. 如果是前端任务，尽量接入现有 play/demo 预览环境
+4. 如果可以启动预览服务，请告诉我局域网访问方式
+5. 尽量少改动现有结构
+6. 完成后总结改动文件、执行过的关键命令、结果
+7. 如遇到失败，明确告诉我失败点和下一步建议
+
+用户任务：
+${userText}
+  `.trim();
+}
+
+/**
+ * 调用本机 codex exec --json
+ */
+async function runCodexJob(chatId, replyToMessageId, userText) {
+  if (runningJobs.has(chatId)) {
+    await sendMessage(
+      chatId,
+      "当前已有一个任务在运行，请先等待完成，或发送 /stop 停止当前任务。",
+      replyToMessageId
+    );
     return;
   }
 
-  const logFile = makeLogFile("code");
-  setStatus({
-    busy: true,
-    currentTask: cleanedPrompt,
-    currentTaskType: "code",
-    lastMessage: "coding",
-    lastLogFile: logFile
+  const statusMsg = await sendMessage(chatId, "任务已接收，正在启动 Codex…", replyToMessageId);
+
+  const prompt = buildPrompt(userText);
+
+  const args = [
+    "exec",
+    "--json",
+    "--full-auto",
+    "--add-dir",
+    "/Users/bilibili/Desktop",
+    prompt,
+  ];
+
+  const child = spawn("codex", args, {
+    cwd: CODEX_WORKDIR,
+    env: { ...process.env },
+    stdio: ["ignore", "pipe", "pipe"],
   });
 
-  await bot.sendMessage(chatId, `开始执行代码任务：\n${shortText(cleanedPrompt, 1000)}`);
+  runningJobs.set(chatId, {
+    child,
+    statusMessageId: statusMsg.message_id,
+    replyToMessageId,
+  });
 
-  const command = `${CODE_COMMAND_PREFIX} ${shellQuoteSingle(cleanedPrompt)}`;
-  const result = await runCommand(command, RESOLVED_PROJECT_DIR, logFile);
+  let stdoutBuffer = "";
+  let stderrBuffer = "";
+  let finalAgentText = "";
+  let lastStatusText = "任务已接收，正在启动 Codex…";
+  let lastEditAt = 0;
 
-  if (result.ok) {
-    setStatus({
-      busy: false,
-      currentTask: "",
-      currentTaskType: "",
-      lastCodeOk: true,
-      lastMessage: "code success"
-    });
+  async function throttledEdit(text) {
+    const now = Date.now();
+    if (!text || text === lastStatusText) return;
+    if (now - lastEditAt < 1200) return;
 
-    await sendLongMessage(
+    lastEditAt = now;
+    lastStatusText = text;
+
+    try {
+      await editMessage(chatId, statusMsg.message_id, safeText(text, 3900));
+    } catch (e) {
+      // 某些情况下 edit 失败，忽略即可
+    }
+  }
+
+  async function notify(text) {
+    if (!text) return;
+    try {
+      await sendLongMessage(chatId, text, replyToMessageId);
+    } catch (e) {
+      console.error("notify error:", e.message);
+    }
+  }
+
+  child.stdout.on("data", async (chunk) => {
+    stdoutBuffer += chunk.toString("utf8");
+
+    while (true) {
+      const idx = stdoutBuffer.indexOf("\n");
+      if (idx === -1) break;
+
+      const line = stdoutBuffer.slice(0, idx).trim();
+      stdoutBuffer = stdoutBuffer.slice(idx + 1);
+
+      if (!line) continue;
+
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+
+      if (!shouldNotify(event)) continue;
+
+      const text = formatCodexEvent(event);
+
+      if (event.item?.type === "agent_message" && event.item?.text) {
+        finalAgentText = event.item.text;
+      }
+
+      // 命令执行类主要编辑状态
+      if (event.item?.type === "command_execution") {
+        await throttledEdit(text);
+        continue;
+      }
+
+      // turn.started / turn.completed 适合作状态
+      if (
+        event.type === "turn.started" ||
+        event.type === "turn.completed" ||
+        event.type === "turn.failed"
+      ) {
+        await throttledEdit(text);
+        continue;
+      }
+
+      // 文件变更 / 计划更新 / agent_message 走消息
+      await notify(text);
+    }
+  });
+
+  child.stderr.on("data", async (chunk) => {
+    stderrBuffer += chunk.toString("utf8");
+    const parts = stderrBuffer.split("\n");
+    stderrBuffer = parts.pop() || "";
+
+    for (const line of parts) {
+      const s = line.trim();
+      if (!s) continue;
+
+      // stderr 更多拿来做“运行中”状态提示
+      await throttledEdit(`运行中：${safeText(s, 1000)}`);
+    }
+  });
+
+  child.on("close", async (code) => {
+    runningJobs.delete(chatId);
+
+    if (code === 0) {
+      try {
+        await editMessage(chatId, statusMsg.message_id, "任务完成。");
+      } catch {}
+
+      if (finalAgentText) {
+        await notify(`最终结果：\n${finalAgentText}`);
+      } else {
+        await notify("任务完成，但没有抓到最终说明。你可以查看项目文件改动确认结果。");
+      }
+    } else {
+      try {
+        await editMessage(chatId, statusMsg.message_id, `任务失败，退出码：${code}`);
+      } catch {}
+
+      const errText = stderrBuffer.trim()
+        ? `stderr：\n${safeText(stderrBuffer, 3000)}`
+        : "Codex 执行失败，但没有额外 stderr。";
+      await notify(errText);
+    }
+  });
+
+  child.on("error", async (err) => {
+    runningJobs.delete(chatId);
+    try {
+      await editMessage(chatId, statusMsg.message_id, `启动 Codex 失败：${err.message}`);
+    } catch {}
+  });
+}
+
+/**
+ * 处理 Telegram 消息
+ */
+async function handleMessage(message) {
+  if (!message?.text) return;
+
+  const chatId = message.chat.id;
+  const messageId = message.message_id;
+  const text = message.text.trim();
+
+  if (!isAllowedUser(message)) {
+    await sendMessage(chatId, "你没有权限使用这个 bot。", messageId);
+    return;
+  }
+
+  if (text === "/start") {
+    await sendMessage(
       chatId,
-      `代码任务完成。\n耗时 ${Math.round(result.durationMs / 1000)} 秒\n\n${shortText(result.stdout || "已执行完成")}`
+      [
+        "已连接本机 Codex CLI。",
+        "直接发自然语言任务即可，例如：",
+        "在当前仓库实现一个移动端聊天窗口组件，并接入现有 demo 页面，完成后告诉我手机如何预览。",
+        "",
+        "可用命令：",
+        "/stop 停止当前任务",
+      ].join("\n"),
+      messageId
     );
-  } else {
-    setStatus({
-      busy: false,
-      currentTask: "",
-      currentTaskType: "",
-      lastCodeOk: false,
-      lastMessage: "code failed"
-    });
-
-    const message = shortText(result.stderr || result.error || result.stdout || "Code task failed");
-    await sendLongMessage(chatId, `代码任务失败。\n\n${message}`);
-  }
-}
-
-async function handleLogs(chatId) {
-  const status = readStatus();
-  const logFile = status.lastLogFile;
-
-  if (!logFile || !fs.existsSync(logFile)) {
-    await bot.sendMessage(chatId, "还没有日志。");
     return;
   }
 
-  const content = fs.readFileSync(logFile, "utf8");
-  const tail = content.slice(-MAX_OUTPUT);
-  await sendLongMessage(chatId, `最近日志：\n${tail}`);
-}
+  if (text === "/stop") {
+    const job = runningJobs.get(chatId);
+    if (!job) {
+      await sendMessage(chatId, "当前没有运行中的任务。", messageId);
+      return;
+    }
 
-async function handlePreview(chatId) {
-  const status = readStatus();
-  if (!status.lastPreviewUrl) {
-    await bot.sendMessage(chatId, "还没有预览地址。");
+    job.child.kill("SIGTERM");
+    runningJobs.delete(chatId);
+    await sendMessage(chatId, "已停止当前任务。", messageId);
     return;
   }
-  await bot.sendMessage(chatId, `最近预览地址：\n${status.lastPreviewUrl}`);
+
+  await runCodexJob(chatId, messageId, text);
 }
 
-async function handleStatus(chatId) {
-  const status = readStatus();
-  await sendLongMessage(chatId, JSON.stringify(status, null, 2));
+/**
+ * 本地轮询 Telegram
+ */
+async function pollOnce() {
+  const result = await tg("getUpdates", {
+    offset,
+    timeout: 20,
+    allowed_updates: ["message"],
+  });
+
+  for (const update of result) {
+    offset = update.update_id + 1;
+
+    try {
+      if (update.message) {
+        await handleMessage(update.message);
+      }
+    } catch (e) {
+      console.error("handle update error:", e);
+    }
+  }
 }
 
-bot.onText(/\/start/, async (msg) => {
-  if (!isAllowed(msg)) return;
+async function startPolling() {
+  if (polling) return;
+  polling = true;
 
-  await bot.sendMessage(
-    msg.chat.id,
-    [
-      "已连接你的 Mac 控制器。",
-      "",
-      "可用命令：",
-      "/build",
-      "/deploy",
-      "/preview",
-      "/status",
-      "/logs",
-      "/code 你的需求"
-    ].join("\n")
-  );
-});
+  console.log("Bot is running with getUpdates polling...");
+  console.log("CODEX_WORKDIR =", CODEX_WORKDIR);
 
-bot.onText(/\/build/, async (msg) => {
-  if (!isAllowed(msg)) return;
-  await handleBuild(msg.chat.id);
-});
+  let backoff = POLL_INTERVAL_MS;
 
-bot.onText(/\/deploy/, async (msg) => {
-  if (!isAllowed(msg)) return;
-  await handleDeploy(msg.chat.id);
-});
+  while (true) {
+    try {
+      await pollOnce();
+      backoff = POLL_INTERVAL_MS; // reset on success
+    } catch (e) {
+      const isNetwork = e.code === 'ECONNRESET' || e.cause?.code === 'ECONNRESET' || e.name === 'AbortError';
+      if (isNetwork) {
+        backoff = Math.min(backoff * 2, 30000);
+        console.error(`poll network error (retrying in ${backoff}ms):`, e.message);
+      } else {
+        backoff = POLL_INTERVAL_MS;
+        console.error("poll error:", e.message);
+      }
+    }
 
-bot.onText(/\/preview/, async (msg) => {
-  if (!isAllowed(msg)) return;
-  await handlePreview(msg.chat.id);
-});
+    await new Promise((resolve) => setTimeout(resolve, backoff));
+  }
+}
 
-bot.onText(/\/status/, async (msg) => {
-  if (!isAllowed(msg)) return;
-  await handleStatus(msg.chat.id);
-});
-
-bot.onText(/\/logs/, async (msg) => {
-  if (!isAllowed(msg)) return;
-  await handleLogs(msg.chat.id);
-});
-
-bot.onText(/\/code(?:\s+([\s\S]+))?/, async (msg, match) => {
-  if (!isAllowed(msg)) return;
-  const promptText = match?.[1] || "";
-  await handleCode(msg.chat.id, promptText);
-});
-
-bot.on("message", async (msg) => {
-  if (!isAllowed(msg)) return;
-  if (!msg.text) return;
-
-  const knownCommands = ["/start", "/build", "/deploy", "/preview", "/status", "/logs", "/code"];
-  if (knownCommands.some((cmd) => msg.text.startsWith(cmd))) return;
-
-  await bot.sendMessage(
-    msg.chat.id,
-    "未知命令。\n可用：/build /deploy /preview /status /logs /code 你的需求"
-  );
-});
-
-app.get("/", (_, res) => {
-  res.send("telegram-mac-control running");
-});
-
-app.listen(Number(PORT), () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Project dir: ${RESOLVED_PROJECT_DIR}`);
+startPolling().catch((err) => {
+  console.error("fatal:", err);
+  process.exit(1);
 });
