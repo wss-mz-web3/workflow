@@ -1,6 +1,8 @@
 import dotenv from "dotenv";
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, statSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
 
 dotenv.config();
@@ -15,6 +17,8 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ALLOWED_USER_ID = String(process.env.TELEGRAM_ALLOWED_USER_ID || "");
 const CODEX_WORKDIR = process.env.CODEX_WORKDIR || process.cwd();
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 1200);
+const STATE_DIR = join(process.cwd(), ".data");
+const STATE_FILE = join(STATE_DIR, "chat-state.json");
 
 if (!TG_TOKEN) {
   throw new Error("Missing TELEGRAM_BOT_TOKEN");
@@ -38,13 +42,53 @@ function describeError(err) {
 const runningJobs = new Map();
 
 /**
- * 每个 chat 的工作目录，默认为 CODEX_WORKDIR
- * chatId -> string
+ * 每个 chat 的持久化状态
+ * chatId -> { workdir?: string, instructionContext?: string }
  */
-const chatWorkdirs = new Map();
+const chatStates = loadChatStates();
+
+function loadChatStates() {
+  if (!existsSync(STATE_FILE)) {
+    return new Map();
+  }
+
+  try {
+    const raw = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+    return new Map(Object.entries(raw));
+  } catch (err) {
+    console.error(`Failed to load chat state: ${describeError(err)}`);
+    return new Map();
+  }
+}
+
+function saveChatStates() {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    const data = Object.fromEntries(chatStates);
+    writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error(`Failed to save chat state: ${describeError(err)}`);
+  }
+}
+
+function getChatState(chatId) {
+  return chatStates.get(String(chatId)) || {};
+}
+
+function setChatState(chatId, patch) {
+  const key = String(chatId);
+  const nextState = { ...getChatState(key), ...patch };
+  chatStates.set(key, nextState);
+  saveChatStates();
+  return nextState;
+}
 
 function getChatWorkdir(chatId) {
-  return chatWorkdirs.get(chatId) || CODEX_WORKDIR;
+  return getChatState(chatId).workdir || CODEX_WORKDIR;
+}
+
+function getInstructionContext(chatId) {
+  return getChatState(chatId).instructionContext || "";
 }
 
 function isExistingDirectory(dir) {
@@ -142,6 +186,25 @@ function isAllowedUser(message) {
   return String(message.from?.id || "") === ALLOWED_USER_ID;
 }
 
+async function downloadTelegramPhoto(photo) {
+  // 取最大尺寸
+  const fileId = photo[photo.length - 1].file_id;
+  const fileInfo = await tg("getFile", { file_id: fileId });
+  const filePath = fileInfo.file_path;
+
+  const url = `https://api.telegram.org/file/bot${TG_TOKEN}/${filePath}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+  if (!res.ok) throw new Error(`下载图片失败：${res.status}`);
+
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const ext = filePath.split(".").pop() || "jpg";
+  const dir = join(tmpdir(), "tg_codex_images");
+  mkdirSync(dir, { recursive: true });
+  const localPath = join(dir, `${fileId}.${ext}`);
+  writeFileSync(localPath, buffer);
+  return localPath;
+}
+
 /**
  * 把 codex --json 事件格式化成 Telegram 可读文本
  */
@@ -232,10 +295,17 @@ function shouldNotify(event) {
 /**
  * 根据任务文本构造 prompt
  */
-function buildPrompt(userText, workdir) {
+function buildPrompt(userText, workdir, instructionContext = "", imagePath = null) {
+  const imageSection = imagePath
+    ? `\n用户附带了一张图片，本地路径为：${imagePath}\n`
+    : "";
+  const contextSection = instructionContext
+    ? `\n持久化指令上下文：\n${instructionContext}\n`
+    : "";
   return `
 你正在本机工作，工作目录是：${workdir}
-
+${imageSection}
+${contextSection}
 执行要求：
 1. 可以修改代码并运行必要命令
 2. 每完成关键步骤都输出简短进度
@@ -255,7 +325,7 @@ ${userText}
 /**
  * 调用本机 codex exec --json
  */
-async function runCodexJob(chatId, replyToMessageId, userText) {
+async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null) {
   if (runningJobs.has(chatId)) {
     await sendMessage(
       chatId,
@@ -268,7 +338,8 @@ async function runCodexJob(chatId, replyToMessageId, userText) {
   const statusMsg = await sendMessage(chatId, "任务已接收，正在启动 Codex…", replyToMessageId);
 
   const workdir = getChatWorkdir(chatId);
-  const prompt = buildPrompt(userText, workdir);
+  const instructionContext = getInstructionContext(chatId);
+  const prompt = buildPrompt(userText, workdir, instructionContext, imagePath);
 
   const args = [
     "exec",
@@ -276,8 +347,13 @@ async function runCodexJob(chatId, replyToMessageId, userText) {
     "--full-auto",
     "--add-dir",
     workdir,
-    prompt,
   ];
+
+  if (imagePath) {
+    args.push("--image", imagePath);
+  }
+
+  args.push(prompt);
 
   const child = spawn("codex", args, {
     cwd: workdir,
@@ -388,7 +464,7 @@ async function runCodexJob(chatId, replyToMessageId, userText) {
 
     if (code === 0) {
       const nextWorkdir = parseReportedWorkdir(finalAgentText) || workdir;
-      chatWorkdirs.set(chatId, nextWorkdir);
+      setChatState(chatId, { workdir: nextWorkdir });
 
       try {
         await editMessage(chatId, statusMsg.message_id, "任务完成。");
@@ -423,16 +499,31 @@ async function runCodexJob(chatId, replyToMessageId, userText) {
  * 处理 Telegram 消息
  */
 async function handleMessage(message) {
-  if (!message?.text) return;
+  if (!message?.text && !message?.photo) return;
 
   const chatId = message.chat.id;
   const messageId = message.message_id;
-  const text = message.text.trim();
 
   if (!isAllowedUser(message)) {
     await sendMessage(chatId, "你没有权限使用这个 bot。", messageId);
     return;
   }
+
+  // 图片消息：下载后直接交给 Codex
+  if (message.photo) {
+    const text = (message.caption || "请分析这张图片").trim();
+    let imagePath;
+    try {
+      imagePath = await downloadTelegramPhoto(message.photo);
+    } catch (e) {
+      await sendMessage(chatId, `图片下载失败：${e.message}`, messageId);
+      return;
+    }
+    await runCodexJob(chatId, messageId, text, imagePath);
+    return;
+  }
+
+  const text = message.text.trim();
 
   if (text === "/start") {
     await sendMessage(
@@ -445,6 +536,9 @@ async function handleMessage(message) {
         "可用命令：",
         `/pwd — 查看当前工作目录（默认：${CODEX_WORKDIR}）`,
         "/cd <路径> — 切换工作目录",
+        "/ctx — 查看持久化指令上下文",
+        "/ctx <内容> — 设置持久化指令上下文",
+        "/clearctx — 清空持久化指令上下文",
         "/stop — 停止当前任务",
       ].join("\n"),
       messageId
@@ -467,8 +561,35 @@ async function handleMessage(message) {
       await sendMessage(chatId, `路径不存在或不是目录：${newDir}`, messageId);
       return;
     }
-    chatWorkdirs.set(chatId, newDir);
+    setChatState(chatId, { workdir: newDir });
     await sendMessage(chatId, `工作目录已切换为：${newDir}`, messageId);
+    return;
+  }
+
+  if (text === "/ctx") {
+    const context = getInstructionContext(chatId);
+    await sendMessage(
+      chatId,
+      context ? `当前持久化指令上下文：\n${safeText(context, 3000)}` : "当前没有持久化指令上下文。",
+      messageId
+    );
+    return;
+  }
+
+  if (text.startsWith("/ctx ")) {
+    const context = text.slice(5).trim();
+    if (!context) {
+      await sendMessage(chatId, "用法：/ctx <内容>", messageId);
+      return;
+    }
+    setChatState(chatId, { instructionContext: context });
+    await sendMessage(chatId, "持久化指令上下文已更新。", messageId);
+    return;
+  }
+
+  if (text === "/clearctx") {
+    setChatState(chatId, { instructionContext: "" });
+    await sendMessage(chatId, "持久化指令上下文已清空。", messageId);
     return;
   }
 
