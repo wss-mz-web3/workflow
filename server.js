@@ -108,6 +108,12 @@ function parseReportedWorkdir(text) {
   return dir;
 }
 
+function appendCapturedText(current, chunk, limit = 12000) {
+  const next = current + chunk;
+  if (next.length <= limit) return next;
+  return next.slice(next.length - limit);
+}
+
 /**
  * Telegram API with retry logic
  */
@@ -353,13 +359,14 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null)
     args.push("--image", imagePath);
   }
 
-  args.push(prompt);
-
   const child = spawn("codex", args, {
     cwd: workdir,
     env: { ...process.env },
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
+
+  child.stdin.write(prompt);
+  child.stdin.end();
 
   runningJobs.set(chatId, {
     child,
@@ -368,7 +375,9 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null)
   });
 
   let stdoutBuffer = "";
-  let stderrBuffer = "";
+  let stdoutDiagnostic = "";
+  let stderrLineBuffer = "";
+  let stderrCaptured = "";
   let finalAgentText = "";
   let lastStatusText = "任务已接收，正在启动 Codex…";
   let lastEditAt = 0;
@@ -398,7 +407,9 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null)
   }
 
   child.stdout.on("data", async (chunk) => {
-    stdoutBuffer += chunk.toString("utf8");
+    const textChunk = chunk.toString("utf8");
+    stdoutBuffer += textChunk;
+    stdoutDiagnostic = appendCapturedText(stdoutDiagnostic, textChunk);
 
     while (true) {
       const idx = stdoutBuffer.indexOf("\n");
@@ -446,9 +457,11 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null)
   });
 
   child.stderr.on("data", async (chunk) => {
-    stderrBuffer += chunk.toString("utf8");
-    const parts = stderrBuffer.split("\n");
-    stderrBuffer = parts.pop() || "";
+    const textChunk = chunk.toString("utf8");
+    stderrCaptured = appendCapturedText(stderrCaptured, textChunk);
+    stderrLineBuffer += textChunk;
+    const parts = stderrLineBuffer.split("\n");
+    stderrLineBuffer = parts.pop() || "";
 
     for (const line of parts) {
       const s = line.trim();
@@ -459,7 +472,7 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null)
     }
   });
 
-  child.on("close", async (code) => {
+  child.on("close", async (code, signal) => {
     runningJobs.delete(chatId);
 
     if (code === 0) {
@@ -477,12 +490,17 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null)
       }
     } else {
       try {
-        await editMessage(chatId, statusMsg.message_id, `任务失败，退出码：${code}`);
+        const reason = signal ? `信号：${signal}` : `退出码：${code}`;
+        await editMessage(chatId, statusMsg.message_id, `任务失败，${reason}`);
       } catch {}
 
-      const errText = stderrBuffer.trim()
-        ? `stderr：\n${safeText(stderrBuffer, 3000)}`
-        : "Codex 执行失败，但没有额外 stderr。";
+      const stderrText = `${stderrCaptured}${stderrLineBuffer}`.trim();
+      const stdoutText = stdoutDiagnostic.trim();
+      const errText = stderrText
+        ? `stderr：\n${safeText(stderrText, 3000)}`
+        : stdoutText
+          ? `stdout 诊断输出：\n${safeText(stdoutText, 3000)}`
+          : "Codex 执行失败，但没有额外 stderr 或 stdout 诊断输出。";
       await notify(errText);
     }
   });
