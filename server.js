@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
 import { spawn } from "node:child_process";
 import { existsSync, statSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
 
@@ -16,6 +16,7 @@ if (proxyUrl) {
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ALLOWED_USER_ID = String(process.env.TELEGRAM_ALLOWED_USER_ID || "");
 const CODEX_WORKDIR = process.env.CODEX_WORKDIR || process.cwd();
+const DESKTOP_ROOT = resolve("/Users/bilibili/Desktop");
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 1200);
 const STATE_DIR = join(process.cwd(), ".data");
 const STATE_FILE = join(STATE_DIR, "chat-state.json");
@@ -93,6 +94,29 @@ function getInstructionContext(chatId) {
 
 function isExistingDirectory(dir) {
   return existsSync(dir) && statSync(dir).isDirectory();
+}
+
+function getCodexAddDirs(workdir) {
+  const dirs = new Set();
+  const resolvedWorkdir = resolve(workdir);
+
+  if (isExistingDirectory(resolvedWorkdir)) {
+    dirs.add(resolvedWorkdir);
+  }
+
+  if (resolvedWorkdir === DESKTOP_ROOT || resolvedWorkdir.startsWith(`${DESKTOP_ROOT}/`)) {
+    dirs.add(DESKTOP_ROOT);
+
+    let current = dirname(resolvedWorkdir);
+    while (current.startsWith(`${DESKTOP_ROOT}/`)) {
+      if (isExistingDirectory(current)) {
+        dirs.add(current);
+      }
+      current = dirname(current);
+    }
+  }
+
+  return [...dirs];
 }
 
 function parseReportedWorkdir(text) {
@@ -344,6 +368,7 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null)
   const statusMsg = await sendMessage(chatId, "任务已接收，正在启动 Codex…", replyToMessageId);
 
   const workdir = getChatWorkdir(chatId);
+  const addDirs = getCodexAddDirs(workdir);
   const instructionContext = getInstructionContext(chatId);
   const prompt = buildPrompt(userText, workdir, instructionContext, imagePath);
 
@@ -351,13 +376,18 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null)
     "exec",
     "--json",
     "--full-auto",
-    "--add-dir",
-    workdir,
   ];
+
+  for (const dir of addDirs) {
+    args.push("--add-dir", dir);
+  }
 
   if (imagePath) {
     args.push("--image", imagePath);
   }
+
+  console.log(`[codex] cwd=${workdir}`);
+  console.log(`[codex] add-dir=${addDirs.join(", ") || "(none)"}`);
 
   const child = spawn("codex", args, {
     cwd: workdir,
