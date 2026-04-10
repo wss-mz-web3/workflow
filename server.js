@@ -44,7 +44,7 @@ const runningJobs = new Map();
 
 /**
  * 每个 chat 的持久化状态
- * chatId -> { workdir?: string, instructionContext?: string }
+ * chatId -> { workdir?: string, instructionContext?: string, previousTask?: string, previousResult?: string }
  */
 const chatStates = loadChatStates();
 
@@ -92,6 +92,14 @@ function getInstructionContext(chatId) {
   return getChatState(chatId).instructionContext || "";
 }
 
+function getPreviousTask(chatId) {
+  return getChatState(chatId).previousTask || "";
+}
+
+function getPreviousResult(chatId) {
+  return getChatState(chatId).previousResult || "";
+}
+
 function isExistingDirectory(dir) {
   return existsSync(dir) && statSync(dir).isDirectory();
 }
@@ -136,6 +144,45 @@ function appendCapturedText(current, chunk, limit = 12000) {
   const next = current + chunk;
   if (next.length <= limit) return next;
   return next.slice(next.length - limit);
+}
+
+function buildFollowupContext(previousTask = "", previousResult = "") {
+  const task = safeText(previousTask, 1200);
+  const result = safeText(previousResult, 2200);
+  if (!task && !result) return "";
+
+  return [
+    "上一轮任务上下文：",
+    task ? `上一轮用户任务：\n${task}` : "",
+    result ? `上一轮执行结果：\n${result}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+function extractTelegramMessageText(message) {
+  if (!message) return "";
+  if (typeof message.text === "string" && message.text.trim()) {
+    return message.text.trim();
+  }
+  if (typeof message.caption === "string" && message.caption.trim()) {
+    return message.caption.trim();
+  }
+  return "";
+}
+
+function buildReplyContext(message) {
+  const replied = message?.reply_to_message;
+  if (!replied) return "";
+
+  const repliedText = extractTelegramMessageText(replied);
+  const lines = ["当前消息是对 Telegram 上一条消息的回复。"];
+
+  if (repliedText) {
+    lines.push(`被回复消息内容：\n${safeText(repliedText, 1800)}`);
+  } else if (replied.photo) {
+    lines.push("被回复消息包含一张图片，但没有可用文字说明。");
+  }
+
+  return lines.join("\n");
 }
 
 /**
@@ -325,17 +372,32 @@ function shouldNotify(event) {
 /**
  * 根据任务文本构造 prompt
  */
-function buildPrompt(userText, workdir, instructionContext = "", imagePath = null) {
+function buildPrompt(
+  userText,
+  workdir,
+  instructionContext = "",
+  previousTurnContext = "",
+  replyContext = "",
+  imagePath = null
+) {
   const imageSection = imagePath
     ? `\n用户附带了一张图片，本地路径为：${imagePath}\n`
     : "";
   const contextSection = instructionContext
     ? `\n持久化指令上下文：\n${instructionContext}\n`
     : "";
+  const previousTurnSection = previousTurnContext
+    ? `\n${previousTurnContext}\n`
+    : "";
+  const replySection = replyContext
+    ? `\n本轮消息补充上下文：\n${replyContext}\n`
+    : "";
   return `
 你正在本机工作，工作目录是：${workdir}
 ${imageSection}
 ${contextSection}
+${previousTurnSection}
+${replySection}
 执行要求：
 1. 可以修改代码并运行必要命令
 2. 每完成关键步骤都输出简短进度
@@ -355,7 +417,7 @@ ${userText}
 /**
  * 调用本机 codex exec --json
  */
-async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null) {
+async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null, replyContext = "") {
   if (runningJobs.has(chatId)) {
     await sendMessage(
       chatId,
@@ -370,7 +432,18 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null)
   const workdir = getChatWorkdir(chatId);
   const addDirs = getCodexAddDirs(workdir);
   const instructionContext = getInstructionContext(chatId);
-  const prompt = buildPrompt(userText, workdir, instructionContext, imagePath);
+  const previousTurnContext = buildFollowupContext(
+    getPreviousTask(chatId),
+    getPreviousResult(chatId)
+  );
+  const prompt = buildPrompt(
+    userText,
+    workdir,
+    instructionContext,
+    previousTurnContext,
+    replyContext,
+    imagePath
+  );
 
   const args = [
     "exec",
@@ -507,7 +580,11 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null)
 
     if (code === 0) {
       const nextWorkdir = parseReportedWorkdir(finalAgentText) || workdir;
-      setChatState(chatId, { workdir: nextWorkdir });
+      setChatState(chatId, {
+        workdir: nextWorkdir,
+        previousTask: userText,
+        previousResult: finalAgentText || "任务完成，但没有抓到最终说明。",
+      });
 
       try {
         await editMessage(chatId, statusMsg.message_id, "任务完成。");
@@ -560,6 +637,7 @@ async function handleMessage(message) {
   // 图片消息：下载后直接交给 Codex
   if (message.photo) {
     const text = (message.caption || "请分析这张图片").trim();
+    const replyContext = buildReplyContext(message);
     let imagePath;
     try {
       imagePath = await downloadTelegramPhoto(message.photo);
@@ -567,11 +645,12 @@ async function handleMessage(message) {
       await sendMessage(chatId, `图片下载失败：${e.message}`, messageId);
       return;
     }
-    await runCodexJob(chatId, messageId, text, imagePath);
+    await runCodexJob(chatId, messageId, text, imagePath, replyContext);
     return;
   }
 
   const text = message.text.trim();
+  const replyContext = buildReplyContext(message);
 
   if (text === "/start") {
     await sendMessage(
@@ -654,7 +733,7 @@ async function handleMessage(message) {
     return;
   }
 
-  await runCodexJob(chatId, messageId, text);
+  await runCodexJob(chatId, messageId, text, null, replyContext);
 }
 
 /**
