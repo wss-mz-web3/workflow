@@ -448,7 +448,8 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null,
   const args = [
     "exec",
     "--json",
-    "--full-auto",
+    "--sandbox",
+    "danger-full-access",
   ];
 
   for (const dir of addDirs) {
@@ -570,7 +571,12 @@ async function runCodexJob(chatId, replyToMessageId, userText, imagePath = null,
       const s = line.trim();
       if (!s) continue;
 
-      // stderr 更多拿来做“运行中”状态提示
+      // filter codex internal reconnect/TLS retry logs (rustls normal behavior)
+      if (/^Reconnecting\.\.\./i.test(s)) continue;
+      if (s.indexOf('peer closed connection without sending TLS close_notify') !== -1) continue;
+      if (s.indexOf('stream disconnected before completion') !== -1) continue;
+
+      // stderr 更多拿来做”运行中”状态提示
       await throttledEdit(`运行中：${safeText(s, 1000)}`);
     }
   });
